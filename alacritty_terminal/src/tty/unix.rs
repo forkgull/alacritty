@@ -2,25 +2,29 @@
 
 use std::ffi::CStr;
 use std::fs::File;
+use std::future::Future;
 use std::io::{Error, ErrorKind, Result};
 use std::mem::MaybeUninit;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::process::CommandExt;
-use std::process::{Child, Command, Stdio};
+use std::pin::Pin;
+use std::process::Command;
+use std::task::{Context, Poll};
 use std::{env, ptr};
 
 use libc::{self, c_int, winsize, TIOCSCTTY};
 use log::error;
-use mio::unix::EventedFd;
 use nix::pty::openpty;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use nix::sys::termios::{self, InputFlags, SetArg};
-use signal_hook::consts as sigconsts;
-use signal_hook_mio::v0_6::Signals;
+
+use smol::prelude::*;
+use smol::process::{Child, Command as SmolCommand, Stdio};
+use smol::Async;
 
 use crate::config::PtyConfig;
 use crate::event::{OnResize, WindowSize};
-use crate::tty::{ChildEvent, EventedPty, EventedReadWrite};
+use crate::tty::{ChildEvent, EventedPty};
 
 macro_rules! die {
     ($($arg:tt)*) => {{
@@ -102,10 +106,7 @@ fn get_pw_entry(buf: &mut [i8; 1024]) -> Result<Passwd<'_>> {
 
 pub struct Pty {
     child: Child,
-    file: File,
-    token: mio::Token,
-    signals: Signals,
-    signals_token: mio::Token,
+    file: Async<File>,
 }
 
 impl Pty {
@@ -219,10 +220,7 @@ pub fn new(config: &PtyConfig, window_size: WindowSize, window_id: u64) -> Resul
         builder.current_dir(dir);
     }
 
-    // Prepare signal handling before spawning child.
-    let signals = Signals::new([sigconsts::SIGCHLD]).expect("error preparing signal handling");
-
-    match builder.spawn() {
+    match SmolCommand::from(builder).spawn() {
         Ok(child) => {
             unsafe {
                 // Maybe this should be done outside of this function so nonblocking
@@ -230,13 +228,7 @@ pub fn new(config: &PtyConfig, window_size: WindowSize, window_id: u64) -> Resul
                 set_nonblocking(master);
             }
 
-            let mut pty = Pty {
-                child,
-                file: unsafe { File::from_raw_fd(master) },
-                token: mio::Token::from(0),
-                signals,
-                signals_token: mio::Token::from(0),
-            };
+            let mut pty = Pty { child, file: Async::new(unsafe { File::from_raw_fd(master) }) };
             pty.on_resize(window_size);
             Ok(pty)
         },
@@ -257,100 +249,45 @@ impl Drop for Pty {
         unsafe {
             libc::kill(self.child.id() as i32, libc::SIGHUP);
         }
-        let _ = self.child.wait();
     }
 }
 
-impl EventedReadWrite for Pty {
-    type Reader = File;
-    type Writer = File;
+impl AsyncRead for Pty {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<Result<usize>> {
+        Pin(&mut self.file).poll_read(cx, buf)
+    }
+}
 
-    #[inline]
-    fn register(
-        &mut self,
-        poll: &mio::Poll,
-        token: &mut dyn Iterator<Item = mio::Token>,
-        interest: mio::Ready,
-        poll_opts: mio::PollOpt,
-    ) -> Result<()> {
-        self.token = token.next().unwrap();
-        poll.register(&EventedFd(&self.file.as_raw_fd()), self.token, interest, poll_opts)?;
-
-        self.signals_token = token.next().unwrap();
-        poll.register(
-            &self.signals,
-            self.signals_token,
-            mio::Ready::readable(),
-            mio::PollOpt::level(),
-        )
+impl AsyncWrite for Pty {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize>> {
+        self.file.poll_write(cx, buf)
     }
 
-    #[inline]
-    fn reregister(
-        &mut self,
-        poll: &mio::Poll,
-        interest: mio::Ready,
-        poll_opts: mio::PollOpt,
-    ) -> Result<()> {
-        poll.reregister(&EventedFd(&self.file.as_raw_fd()), self.token, interest, poll_opts)?;
-
-        poll.reregister(
-            &self.signals,
-            self.signals_token,
-            mio::Ready::readable(),
-            mio::PollOpt::level(),
-        )
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        self.file.poll_flush(cx)
     }
 
-    #[inline]
-    fn deregister(&mut self, poll: &mio::Poll) -> Result<()> {
-        poll.deregister(&EventedFd(&self.file.as_raw_fd()))?;
-        poll.deregister(&self.signals)
-    }
-
-    #[inline]
-    fn reader(&mut self) -> &mut File {
-        &mut self.file
-    }
-
-    #[inline]
-    fn read_token(&self) -> mio::Token {
-        self.token
-    }
-
-    #[inline]
-    fn writer(&mut self) -> &mut File {
-        &mut self.file
-    }
-
-    #[inline]
-    fn write_token(&self) -> mio::Token {
-        self.token
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        self.file.poll_close(cx)
     }
 }
 
 impl EventedPty for Pty {
-    #[inline]
-    fn next_child_event(&mut self) -> Option<ChildEvent> {
-        self.signals.pending().next().and_then(|signal| {
-            if signal != sigconsts::SIGCHLD {
-                return None;
-            }
-
-            match self.child.try_wait() {
+    fn wait_child_event(&mut self) -> Pin<Box<dyn Future<Output = ChildEvent> + Send + '_>> {
+        Box::pin(async move {
+            // Wait for the child to terminate.
+            match self.child.status().await {
                 Err(e) => {
-                    error!("Error checking child process termination: {}", e);
-                    None
+                    error!("Error waiting for child process termination: {}", e);
+                    ChildEvent::Exited
                 },
-                Ok(None) => None,
-                Ok(_) => Some(ChildEvent::Exited),
+                Ok(_) => ChildEvent::Exited,
             }
         })
-    }
-
-    #[inline]
-    fn child_event_token(&self) -> mio::Token {
-        self.signals_token
     }
 }
 

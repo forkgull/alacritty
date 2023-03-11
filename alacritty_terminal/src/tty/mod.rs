@@ -1,8 +1,8 @@
 //! TTY related functionality.
 
-use std::path::PathBuf;
 use std::env;
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 
 use smol::io::{AsyncRead, AsyncWrite};

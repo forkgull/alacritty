@@ -1,18 +1,17 @@
 //! The main event loop which performs I/O on the pseudoterminal.
 
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io::{self, ErrorKind, Read, Write};
 use std::marker::Send;
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Instant;
 
 use log::error;
 
 use smol::channel::{self, Receiver, Sender};
 use smol::fs::File;
-use smol::lock::Mutex;
 use smol::prelude::*;
 
 use crate::event::{self, Event, EventListener, WindowSize};
@@ -158,15 +157,7 @@ where
         ref_test: bool,
     ) -> EventLoop<T, U> {
         let (tx, rx) = channel::unbounded();
-        EventLoop {
-            pty,
-            tx,
-            rx,
-            terminal,
-            event_proxy,
-            hold,
-            ref_test,
-        }
+        EventLoop { pty, tx, rx, terminal, event_proxy, hold, ref_test }
     }
 
     pub fn channel(&self) -> Sender<Msg> {
@@ -174,7 +165,7 @@ where
     }
 
     /// Handle a channel message.
-    /// 
+    ///
     /// Returns `false` when a shutdown message was received.
     fn handle_message(&mut self, state: &mut State, msg: Msg) -> bool {
         match msg {
@@ -197,14 +188,14 @@ where
         }
 
         true
-    } 
+    }
 
     #[inline]
     async fn pty_read<X>(
         pty: &T,
         terminal_lock: &FairMutex<Term<U>>,
         event_proxy: &U,
-        state: &Mutex<State>,
+        state: &RefCell<State>,
         buf: &mut [u8],
         mut writer: Option<&mut X>,
     ) -> io::Result<()>
@@ -253,7 +244,7 @@ where
 
             // Parse the incoming bytes.
             {
-                let mut state = state.lock().await;
+                let mut state = state.borrow_mut();
                 for byte in &buf[..unprocessed] {
                     state.parser.advance(&mut **terminal, *byte);
                 }
@@ -269,7 +260,7 @@ where
         }
 
         // Queue terminal redraw unless all processed bytes were synchronized.
-        if state.lock().await.parser.sync_bytes_count() < processed && processed > 0 {
+        if state.borrow_mut().parser.sync_bytes_count() < processed && processed > 0 {
             event_proxy.send_event(Event::Wakeup);
         }
 
@@ -277,27 +268,23 @@ where
     }
 
     #[inline]
-    async fn pty_write(pty: &T, state: &Mutex<State>) -> io::Result<()> {
-        let mut state_lock = state.lock().await;
-        state_lock.ensure_next();
-        let mut state_lock = Some(state_lock);
-
-        'write_many: while let Some(mut current) = state_lock.as_mut().unwrap().take_current() {
+    async fn pty_write(pty: &T, state: &RefCell<State>) -> io::Result<()> {
+        'write_many: while let Some(mut current) = state.borrow_mut().take_current() {
             'write_one: loop {
                 match pty.write(current.remaining_bytes()).await {
                     Ok(0) => {
-                        state.set_current(Some(current));
+                        state.borrow_mut().set_current(Some(current));
                         break 'write_many;
                     },
                     Ok(n) => {
                         current.advance(n);
                         if current.finished() {
-                            state.goto_next();
+                            state.borrow_mut().goto_next();
                             break 'write_one;
                         }
                     },
                     Err(err) => {
-                        state.set_current(Some(current));
+                        state.borrow_mut().set_current(Some(current));
                         match err.kind() {
                             ErrorKind::Interrupted | ErrorKind::WouldBlock => break 'write_many,
                             _ => return Err(err),
@@ -312,30 +299,22 @@ where
 
     pub fn spawn(mut self) -> JoinHandle<(Self, State)> {
         thread::spawn_named("PTY reader", move || {
-            let mut state = Mutex::new(State::default());
+            let mut state = RefCell::new(State::default());
             let mut buf = [0u8; READ_BUFFER_SIZE];
 
-            let mut tokens = (0..).map(Into::into);
-
-            let poll_opts = PollOpt::edge() | PollOpt::oneshot();
-
-            let channel_token = tokens.next().unwrap();
-            self.poll.register(&self.rx, channel_token, Ready::readable(), poll_opts).unwrap();
-
-            // Register TTY through EventedRW interface.
-            self.pty.register(&self.poll, &mut tokens, Ready::readable(), poll_opts).unwrap();
-
-            let mut events = Events::with_capacity(1024);
-
             // Split `self` up into mutable-reference parts for tasks.
-            let Self { executor, pty, rx, tx, terminal, event_proxy, hold, ref_test } = &mut self;
+            let Self { pty, rx, tx, terminal, event_proxy, hold, ref_test } = &mut self;
 
             // Start blocking and running the executor.
-            let event_proxy = self.event_proxy;
+            let executor = smol::LocalExecutor::new();
+            let (shutdown, signal) = smol::channel::bounded::<()>(1);
             smol::block_on(executor.run(async move {
-
                 let mut pipe = if self.ref_test {
-                    Some(File::create("./alacritty.recording").await.expect("create alacritty recording"))
+                    Some(
+                        File::create("./alacritty.recording")
+                            .await
+                            .expect("create alacritty recording"),
+                    )
                 } else {
                     None
                 };
@@ -344,22 +323,65 @@ where
                 let pty = &*pty;
                 let event_proxy = &*event_proxy;
 
+                // Read from the PTY.
                 let read_from_pty = executor.spawn({
+                    let shutdown = shutdown.clone();
                     async move {
                         loop {
-                            if let Err(e) = Self::pty_read(pty, terminal, event_proxy, &state, &mut buf, pipe.as_mut()).await {
+                            if let Err(e) = Self::pty_read(
+                                pty,
+                                terminal,
+                                event_proxy,
+                                &state,
+                                &mut buf,
+                                pipe.as_mut(),
+                            )
+                            .await
+                            {
                                 error!("Error reading from pty: {}", e);
+                                shutdown.send(()).await.ok();
                                 break;
                             }
                         }
                     }
                 });
 
+                // Write to the PTY.
                 let write_to_pty = executor.spawn({
                     async move {
                         loop {
                             if let Err(e) = Self::pty_write(pty, &state).await {
                                 error!("Error writing to pty: {}", e);
+                                shutdown.send(()).await.ok();
+                                break;
+                            }
+                        }
+                    }
+                });
+
+                // Handle child exit.
+                let child_pty = executor.spawn({
+                    async move {
+                        loop {
+                            if let tty::ChildEvent::Exited = pty.wait_child_event().await {
+                                if self.hold {
+                                    // With hold enabled, make sure the PTY is drained.
+                                    let _ = Self::pty_read(
+                                        pty,
+                                        terminal,
+                                        event_proxy,
+                                        &state,
+                                        &mut buf,
+                                        pipe.as_mut(),
+                                    )
+                                    .await;
+                                } else {
+                                    // Without hold, shutdown the terminal.
+                                    self.terminal.lock().exit();
+                                }
+
+                                self.event_proxy.send_event(Event::Wakeup);
+                                shutdown.send(()).await.ok();
                                 break;
                             }
                         }
@@ -368,15 +390,19 @@ where
 
                 loop {
                     // Begin synchronizing the terminal.
-                    let sync_timeout = state.lock().await.parser.sync_timeout();
+                    let sync_timeout = state.borrow_mut().parser.sync_timeout();
 
                     // If the timeout is reached before we receive any events, we need to wake up
                     // the window.
                     let run_timeout = async move {
-                        sync_timeout.map_or_else(|| smol::Timer::never(), |timeout| smol::Timer::at(*timeout))
+                        sync_timeout
+                            .map_or_else(
+                                || smol::Timer::never(),
+                                |timeout| smol::Timer::at(*timeout),
+                            )
                             .await;
 
-                        state.lock().await.parser.stop_sync(&mut *terminal.lock());
+                        state.borrow_mut().parser.stop_sync(&mut *terminal.lock());
                         event_proxy.send_event(Event::Wakeup);
                         true
                     };
@@ -387,7 +413,7 @@ where
                         let msg = self.rx.recv().await.expect("Channel should never be closed");
 
                         // Process the message.
-                        let mut state = state.lock().await;
+                        let mut state = state.borrow_mut();
                         let mut keep_going = self.handle_message(&mut state, msg);
 
                         // Drain the remaining messages.
@@ -398,7 +424,13 @@ where
                         keep_going
                     };
 
-                    let keep_going = run_timeout.or(drain_channel).await;
+                    // If another task sends a shutdown signal, we should stop the event loop.
+                    let shutdown = async move {
+                        signal.recv().await;
+                        false
+                    };
+
+                    let keep_going = shutdown.or(run_timeout).or(drain_channel).await;
 
                     if !keep_going {
                         break;
@@ -409,96 +441,12 @@ where
                 }
 
                 // Cancel outstanding tasks.
-                drop(read_from_pty);
+                read_from_pty.cancel().await;
+                write_to_pty.cancel().await;
+                child_pty.cancel().await;
             }));
 
-            'event_loop: loop {
-                // Wakeup the event loop when a synchronized update timeout was reached.
-                let sync_timeout = state.parser.sync_timeout();
-                let timeout = sync_timeout.map(|st| st.saturating_duration_since(Instant::now()));
-
-                // Handle synchronized update timeout.
-                if events.is_empty() {
-
-                    continue;
-                }
-
-                for event in events.iter() {
-                    match event.token() {
-                        token if token == channel_token => {
-                            if !self.channel_event(channel_token, &mut state) {
-                                break 'event_loop;
-                            }
-                        },
-
-                        token if token == self.pty.child_event_token() => {
-                            if let Some(tty::ChildEvent::Exited) = self.pty.next_child_event() {
-                                if self.hold {
-                                    // With hold enabled, make sure the PTY is drained.
-                                    let _ = self.pty_read(&mut state, &mut buf, pipe.as_mut());
-                                } else {
-                                    // Without hold, shutdown the terminal.
-                                    self.terminal.lock().exit();
-                                }
-
-                                self.event_proxy.send_event(Event::Wakeup);
-                                break 'event_loop;
-                            }
-                        },
-
-                        token
-                            if token == self.pty.read_token()
-                                || token == self.pty.write_token() =>
-                        {
-                            #[cfg(unix)]
-                            if UnixReady::from(event.readiness()).is_hup() {
-                                // Don't try to do I/O on a dead PTY.
-                                continue;
-                            }
-
-                            if event.readiness().is_readable() {
-                                if let Err(err) = self.pty_read(&mut state, &mut buf, pipe.as_mut())
-                                {
-                                    // On Linux, a `read` on the master side of a PTY can fail
-                                    // with `EIO` if the client side hangs up.  In that case,
-                                    // just loop back round for the inevitable `Exited` event.
-                                    // This sucks, but checking the process is either racy or
-                                    // blocking.
-                                    #[cfg(target_os = "linux")]
-                                    if err.raw_os_error() == Some(libc::EIO) {
-                                        continue;
-                                    }
-
-                                    error!("Error reading from PTY in event loop: {}", err);
-                                    break 'event_loop;
-                                }
-                            }
-
-                            if event.readiness().is_writable() {
-                                if let Err(err) = self.pty_write(&mut state) {
-                                    error!("Error writing to PTY in event loop: {}", err);
-                                    break 'event_loop;
-                                }
-                            }
-                        },
-                        _ => (),
-                    }
-                }
-
-                // Register write interest if necessary.
-                let mut interest = Ready::readable();
-                if state.needs_write() {
-                    interest.insert(Ready::writable());
-                }
-                // Reregister with new interest.
-                self.pty.reregister(&self.poll, interest, poll_opts).unwrap();
-            }
-
-            // The evented instances are not dropped here so deregister them explicitly.
-            let _ = self.poll.deregister(&self.rx);
-            let _ = self.pty.deregister(&self.poll);
-
-            (self, state)
+            (self, state.into_inner())
         })
     }
 }
