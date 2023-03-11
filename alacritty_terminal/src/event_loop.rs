@@ -2,7 +2,6 @@
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
-use std::fs::File;
 use std::io::{self, ErrorKind, Read, Write};
 use std::marker::Send;
 use std::sync::Arc;
@@ -10,10 +9,11 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use log::error;
-#[cfg(not(windows))]
-use mio::unix::UnixReady;
-use mio::{self, Events, PollOpt, Ready};
-use mio_extras::channel::{self, Receiver, Sender};
+
+use smol::channel::{self, Receiver, Sender};
+use smol::fs::File;
+use smol::lock::Mutex;
+use smol::prelude::*;
 
 use crate::event::{self, Event, EventListener, WindowSize};
 use crate::sync::FairMutex;
@@ -44,7 +44,6 @@ pub enum Msg {
 /// Handles all the PTY I/O and runs the PTY parser which updates terminal
 /// state.
 pub struct EventLoop<T: tty::EventedPty, U: EventListener> {
-    poll: mio::Poll,
     pty: T,
     rx: Receiver<Msg>,
     tx: Sender<Msg>,
@@ -73,13 +72,13 @@ impl event::Notify for Notifier {
             return;
         }
 
-        let _ = self.0.send(Msg::Input(bytes));
+        let _ = self.0.try_send(Msg::Input(bytes));
     }
 }
 
 impl event::OnResize for Notifier {
     fn on_resize(&mut self, window_size: WindowSize) {
-        let _ = self.0.send(Msg::Resize(window_size));
+        let _ = self.0.try_send(Msg::Resize(window_size));
     }
 }
 
@@ -158,9 +157,8 @@ where
         hold: bool,
         ref_test: bool,
     ) -> EventLoop<T, U> {
-        let (tx, rx) = channel::channel();
+        let (tx, rx) = channel::unbounded();
         EventLoop {
-            poll: mio::Poll::new().expect("create mio Poll"),
             pty,
             tx,
             rx,
@@ -175,55 +173,54 @@ where
         self.tx.clone()
     }
 
+    /// Handle a channel message.
+    /// 
+    /// Returns `false` when a shutdown message was received.
+    fn handle_message(&mut self, state: &mut State, msg: Msg) -> bool {
+        match msg {
+            Msg::Input(input) => state.write_list.push_back(input),
+            Msg::Resize(window_size) => self.pty.on_resize(window_size),
+            Msg::Shutdown => return false,
+        }
+
+        true
+    }
+
     /// Drain the channel.
     ///
     /// Returns `false` when a shutdown message was received.
     fn drain_recv_channel(&mut self, state: &mut State) -> bool {
         while let Ok(msg) = self.rx.try_recv() {
-            match msg {
-                Msg::Input(input) => state.write_list.push_back(input),
-                Msg::Resize(window_size) => self.pty.on_resize(window_size),
-                Msg::Shutdown => return false,
+            if !self.handle_message(state, msg) {
+                return false;
             }
         }
 
         true
-    }
-
-    /// Returns a `bool` indicating whether or not the event loop should continue running.
-    #[inline]
-    fn channel_event(&mut self, token: mio::Token, state: &mut State) -> bool {
-        if !self.drain_recv_channel(state) {
-            return false;
-        }
-
-        self.poll
-            .reregister(&self.rx, token, Ready::readable(), PollOpt::edge() | PollOpt::oneshot())
-            .unwrap();
-
-        true
-    }
+    } 
 
     #[inline]
-    fn pty_read<X>(
-        &mut self,
-        state: &mut State,
+    async fn pty_read<X>(
+        pty: &T,
+        terminal_lock: &FairMutex<Term<U>>,
+        event_proxy: &U,
+        state: &Mutex<State>,
         buf: &mut [u8],
         mut writer: Option<&mut X>,
     ) -> io::Result<()>
     where
-        X: Write,
+        X: AsyncWrite,
     {
         let mut unprocessed = 0;
         let mut processed = 0;
 
         // Reserve the next terminal lock for PTY reading.
-        let _terminal_lease = Some(self.terminal.lease());
+        let _terminal_lease = Some(terminal_lock.lease());
         let mut terminal = None;
 
         loop {
             // Read from the PTY.
-            match self.pty.reader().read(&mut buf[unprocessed..]) {
+            match pty.read(&mut buf[unprocessed..]).await {
                 // This is received on Windows/macOS when no more data is readable from the PTY.
                 Ok(0) if unprocessed == 0 => break,
                 Ok(got) => unprocessed += got,
@@ -241,9 +238,9 @@ where
             // Attempt to lock the terminal.
             let terminal = match &mut terminal {
                 Some(terminal) => terminal,
-                None => terminal.insert(match self.terminal.try_lock_unfair() {
+                None => terminal.insert(match terminal_lock.try_lock_unfair() {
                     // Force block if we are at the buffer size limit.
-                    None if unprocessed >= READ_BUFFER_SIZE => self.terminal.lock_unfair(),
+                    None if unprocessed >= READ_BUFFER_SIZE => terminal_lock.lock_unfair(),
                     None => continue,
                     Some(terminal) => terminal,
                 }),
@@ -251,12 +248,15 @@ where
 
             // Write a copy of the bytes to the ref test file.
             if let Some(writer) = &mut writer {
-                writer.write_all(&buf[..unprocessed]).unwrap();
+                writer.write_all(&buf[..unprocessed]).await.unwrap();
             }
 
             // Parse the incoming bytes.
-            for byte in &buf[..unprocessed] {
-                state.parser.advance(&mut **terminal, *byte);
+            {
+                let mut state = state.lock().await;
+                for byte in &buf[..unprocessed] {
+                    state.parser.advance(&mut **terminal, *byte);
+                }
             }
 
             processed += unprocessed;
@@ -269,20 +269,22 @@ where
         }
 
         // Queue terminal redraw unless all processed bytes were synchronized.
-        if state.parser.sync_bytes_count() < processed && processed > 0 {
-            self.event_proxy.send_event(Event::Wakeup);
+        if state.lock().await.parser.sync_bytes_count() < processed && processed > 0 {
+            event_proxy.send_event(Event::Wakeup);
         }
 
         Ok(())
     }
 
     #[inline]
-    fn pty_write(&mut self, state: &mut State) -> io::Result<()> {
-        state.ensure_next();
+    async fn pty_write(pty: &T, state: &Mutex<State>) -> io::Result<()> {
+        let mut state_lock = state.lock().await;
+        state_lock.ensure_next();
+        let mut state_lock = Some(state_lock);
 
-        'write_many: while let Some(mut current) = state.take_current() {
+        'write_many: while let Some(mut current) = state_lock.as_mut().unwrap().take_current() {
             'write_one: loop {
-                match self.pty.writer().write(current.remaining_bytes()) {
+                match pty.write(current.remaining_bytes()).await {
                     Ok(0) => {
                         state.set_current(Some(current));
                         break 'write_many;
@@ -310,7 +312,7 @@ where
 
     pub fn spawn(mut self) -> JoinHandle<(Self, State)> {
         thread::spawn_named("PTY reader", move || {
-            let mut state = State::default();
+            let mut state = Mutex::new(State::default());
             let mut buf = [0u8; READ_BUFFER_SIZE];
 
             let mut tokens = (0..).map(Into::into);
@@ -325,28 +327,99 @@ where
 
             let mut events = Events::with_capacity(1024);
 
-            let mut pipe = if self.ref_test {
-                Some(File::create("./alacritty.recording").expect("create alacritty recording"))
-            } else {
-                None
-            };
+            // Split `self` up into mutable-reference parts for tasks.
+            let Self { executor, pty, rx, tx, terminal, event_proxy, hold, ref_test } = &mut self;
+
+            // Start blocking and running the executor.
+            let event_proxy = self.event_proxy;
+            smol::block_on(executor.run(async move {
+
+                let mut pipe = if self.ref_test {
+                    Some(File::create("./alacritty.recording").await.expect("create alacritty recording"))
+                } else {
+                    None
+                };
+
+                // Spawn tasks that polls the PTY.
+                let pty = &*pty;
+                let event_proxy = &*event_proxy;
+
+                let read_from_pty = executor.spawn({
+                    async move {
+                        loop {
+                            if let Err(e) = Self::pty_read(pty, terminal, event_proxy, &state, &mut buf, pipe.as_mut()).await {
+                                error!("Error reading from pty: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                });
+
+                let write_to_pty = executor.spawn({
+                    async move {
+                        loop {
+                            if let Err(e) = Self::pty_write(pty, &state).await {
+                                error!("Error writing to pty: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                });
+
+                loop {
+                    // Begin synchronizing the terminal.
+                    let sync_timeout = state.lock().await.parser.sync_timeout();
+
+                    // If the timeout is reached before we receive any events, we need to wake up
+                    // the window.
+                    let run_timeout = async move {
+                        sync_timeout.map_or_else(|| smol::Timer::never(), |timeout| smol::Timer::at(*timeout))
+                            .await;
+
+                        state.lock().await.parser.stop_sync(&mut *terminal.lock());
+                        event_proxy.send_event(Event::Wakeup);
+                        true
+                    };
+
+                    // Drain channel events until the channel wants to shutdown.
+                    let drain_channel = async move {
+                        // Wait for a new channel message.
+                        let msg = self.rx.recv().await.expect("Channel should never be closed");
+
+                        // Process the message.
+                        let mut state = state.lock().await;
+                        let mut keep_going = self.handle_message(&mut state, msg);
+
+                        // Drain the remaining messages.
+                        if keep_going {
+                            keep_going = self.drain_recv_channel(&mut state);
+                        }
+
+                        keep_going
+                    };
+
+                    let keep_going = run_timeout.or(drain_channel).await;
+
+                    if !keep_going {
+                        break;
+                    }
+
+                    // Make sure we're not blocking the terminal too long unnecessarily.
+                    smol::future::yield_now().await;
+                }
+
+                // Cancel outstanding tasks.
+                drop(read_from_pty);
+            }));
 
             'event_loop: loop {
                 // Wakeup the event loop when a synchronized update timeout was reached.
                 let sync_timeout = state.parser.sync_timeout();
                 let timeout = sync_timeout.map(|st| st.saturating_duration_since(Instant::now()));
 
-                if let Err(err) = self.poll.poll(&mut events, timeout) {
-                    match err.kind() {
-                        ErrorKind::Interrupted => continue,
-                        _ => panic!("EventLoop polling error: {:?}", err),
-                    }
-                }
-
                 // Handle synchronized update timeout.
                 if events.is_empty() {
-                    state.parser.stop_sync(&mut *self.terminal.lock());
-                    self.event_proxy.send_event(Event::Wakeup);
+
                     continue;
                 }
 
